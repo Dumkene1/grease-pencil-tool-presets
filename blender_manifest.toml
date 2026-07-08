@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "gp_tool_presets"
+version = "1.0.0"
+name = "GP Tool Presets"
+tagline = "Reusable Grease Pencil tool presets for Blender"
+maintainer = "Dk"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+license = ["SPDX:MIT"]
+
+tags = ["Grease Pencil", "Animation", "2D", "Workflow"]
