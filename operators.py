@@ -224,7 +224,7 @@ class GPTOOLPRESETS_OT_export(bpy.types.Operator, ExportHelper):
         prefs = get_addon_preferences(context)
         data = {
             "addon": "GP Tool Presets",
-            "schema_version": 9,
+            "schema_version": 10,
             "blender_version_exported": ".".join(str(x) for x in bpy.app.version),
             "presets": [preset_from_json(item.data_json) for item in prefs.presets],
         }

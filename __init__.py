@@ -3,7 +3,7 @@
 bl_info = {
     "name": "GP Tool Presets",
     "author": "Dk",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > GP Presets",
     "description": "Save and apply Grease Pencil tool settings as reusable presets.",

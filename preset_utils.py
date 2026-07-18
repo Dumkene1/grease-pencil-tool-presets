@@ -3,7 +3,7 @@
 import json
 import bpy
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 RUNTIME_BRUSH_NAME = "GP Tool Preset"
 
 IMPORTANT_BRUSH_ATTRS = [
@@ -21,7 +21,9 @@ KEYWORDS = (
     "trim", "outline", "thickness", "random", "jitter", "radius", "factor",
     "rotation", "hue", "saturation", "value", "pressure", "fill", "gap",
     "extend", "dilate", "material", "opacity", "eraser", "grease", "gpencil",
-    "curve", "falloff", "active_smooth",
+    "curve", "falloff", "active_smooth", "solver", "delaunay",
+    "precision", "invert", "boundary", "extension", "closure",
+    "threshold", "leak", "mode", "layer", "guide", "limit",
 )
 
 
@@ -297,21 +299,136 @@ def ensure_gp_mat(mat):
     return safe_get(mat, "grease_pencil")
 
 
-def capture_material_info(mat):
-    if mat is None:
-        return {"name": "", "stroke_hex": "", "fill_hex": ""}
-    gp = ensure_gp_mat(mat)
-    stroke_color = safe_get(gp, "color")
-    fill_color = safe_get(gp, "fill_color")
+def _valid_color(value):
+    try:
+        values = list(value)
+        return len(values) >= 3 and all(isinstance(v, (int, float)) for v in values[:3])
+    except Exception:
+        return False
+
+
+def _first_color(candidates):
+    for source_path, obj, attr in candidates:
+        value = safe_get(obj, attr)
+        if _valid_color(value):
+            return value, source_path
+    return None, ""
+
+
+def get_gp_paint_container(context):
+    ts = safe_get(context, "tool_settings")
+    for name in ("gpencil_paint", "grease_pencil_paint"):
+        container = safe_get(ts, name)
+        if container is not None:
+            return name, container
+    for name, container in brush_containers(context):
+        if "gpencil" in name.lower() or "grease_pencil" in name.lower():
+            return name, container
+    return "", None
+
+
+def detect_color_mode(context):
+    """Detect whether the GP tool uses Material or Color Attribute color."""
+    container_name, paint = get_gp_paint_container(context)
+    raw = safe_get(paint, "color_mode", "")
+    raw_text = str(raw or "").upper()
+    if raw_text in {"VERTEXCOLOR", "COLOR_ATTRIBUTE", "VERTEX_COLOR"}:
+        return "COLOR_ATTRIBUTE", raw_text, container_name
+    if raw_text:
+        return "MATERIAL", raw_text, container_name
+    return "MATERIAL", "", container_name
+
+
+def capture_color_info(context, mat, brush):
+    color_source, raw_mode, container_name = detect_color_mode(context)
+    gp = ensure_gp_mat(mat) if mat is not None else None
+    gp_brush = safe_get(brush, "gpencil_settings") or safe_get(brush, "grease_pencil_settings")
+    _, paint = get_gp_paint_container(context)
+
+    if color_source == "COLOR_ATTRIBUTE":
+        stroke_color, stroke_path = _first_color((
+            ("brush.color", brush, "color"),
+            ("gpencil_settings.color", gp_brush, "color"),
+            ("paint.color", paint, "color"),
+            ("brush.primary_color", brush, "primary_color"),
+        ))
+        fill_color, fill_path = _first_color((
+            ("brush.secondary_color", brush, "secondary_color"),
+            ("gpencil_settings.fill_color", gp_brush, "fill_color"),
+            ("paint.secondary_color", paint, "secondary_color"),
+            ("paint.fill_color", paint, "fill_color"),
+        ))
+    else:
+        stroke_color, stroke_path = _first_color((
+            ("material.grease_pencil.color", gp, "color"),
+            ("material.diffuse_color", mat, "diffuse_color"),
+        ))
+        fill_color, fill_path = _first_color((
+            ("material.grease_pencil.fill_color", gp, "fill_color"),
+        ))
+
     return {
-        "name": mat.name,
+        "name": mat.name if mat else "",
+        "color_source": color_source,
+        "color_mode_raw": raw_mode,
+        "paint_container": container_name,
         "stroke_color": to_json_value(stroke_color),
         "stroke_hex": color_to_hex(stroke_color),
+        "stroke_source_path": stroke_path,
         "fill_color": to_json_value(fill_color),
         "fill_hex": color_to_hex(fill_color),
+        "fill_source_path": fill_path,
         "show_stroke": safe_get(gp, "show_stroke"),
         "show_fill": safe_get(gp, "show_fill"),
     }
+
+
+def apply_saved_color_mode(context, material_info, runtime_brush):
+    """Restore Color Attribute values without changing material data."""
+    if not isinstance(material_info, dict):
+        return {"applied": 0, "skipped": []}
+
+    source = material_info.get("color_source", "MATERIAL")
+    _, paint = get_gp_paint_container(context)
+    applied, skipped = 0, []
+
+    if paint is not None and hasattr(paint, "color_mode"):
+        target_mode = "VERTEXCOLOR" if source == "COLOR_ATTRIBUTE" else "MATERIAL"
+        if safe_set(paint, "color_mode", target_mode):
+            applied += 1
+        else:
+            skipped.append("color_mode")
+
+    if source != "COLOR_ATTRIBUTE" or runtime_brush is None:
+        return {"applied": applied, "skipped": skipped}
+
+    gp_brush = safe_get(runtime_brush, "gpencil_settings") or safe_get(
+        runtime_brush, "grease_pencil_settings"
+    )
+    stroke = material_info.get("stroke_color")
+    fill = material_info.get("fill_color")
+
+    if stroke is not None:
+        restored = False
+        for obj, attr in ((runtime_brush, "color"), (gp_brush, "color")):
+            if obj is not None and safe_set(obj, attr, stroke):
+                restored = True
+                break
+        applied += int(restored)
+        if not restored:
+            skipped.append("stroke color attribute")
+
+    if fill is not None:
+        restored = False
+        for obj, attr in ((runtime_brush, "secondary_color"), (gp_brush, "fill_color")):
+            if obj is not None and safe_set(obj, attr, fill):
+                restored = True
+                break
+        applied += int(restored)
+        if not restored:
+            skipped.append("fill color attribute")
+
+    return {"applied": applied, "skipped": skipped}
 
 
 def set_active_existing_material(context, material_name):
@@ -389,10 +506,142 @@ def restore_tool_settings(context, data):
     return {"applied": applied, "skipped": skipped}
 
 
+
+FILL_OPERATOR_IDS = (
+    "grease_pencil.fill",
+    "grease_pencil.fill_between_strokes",
+)
+
+FILL_SETTING_KEYWORDS = (
+    "fill", "gap", "solver", "delaunay", "precision", "invert",
+    "boundary", "extension", "extend", "closure", "threshold",
+    "leak", "layer", "guide", "limit", "radius", "factor",
+)
+
+
+def _rna_pointer_children(obj):
+    """Yield writable/readable RNA pointer children without recursing indefinitely."""
+    if obj is None:
+        return
+    rna = safe_get(obj, "bl_rna")
+    for prop in safe_get(rna, "properties", []):
+        ident = getattr(prop, "identifier", "")
+        if not ident or ident == "rna_type":
+            continue
+        if getattr(prop, "type", "") != "POINTER":
+            continue
+        child = safe_get(obj, ident)
+        if child is not None and safe_get(child, "bl_rna") is not None:
+            yield ident, child
+
+
+def capture_fill_settings(context):
+    """Capture Fill-related values exposed by Blender 5.1/5.2.
+
+    This is capability-based rather than version-based. Blender 5.1 simply
+    stores fewer values; Blender 5.2 can contribute the new solver/gap values.
+    """
+    result = {"tool_settings": {}, "nested": {}, "operator_properties": {}}
+    ts = safe_get(context, "tool_settings")
+    if ts is not None:
+        result["tool_settings"] = collect_props(
+            ts, include_all=False, keywords=FILL_SETTING_KEYWORDS, limit=400
+        )
+        for child_name, child in _rna_pointer_children(ts):
+            name_low = child_name.lower()
+            child_values = collect_props(
+                child, include_all=False, keywords=FILL_SETTING_KEYWORDS, limit=400
+            )
+            if child_values and (
+                any(k in name_low for k in ("grease", "gpencil", "paint", "fill"))
+                or any(any(k in prop.lower() for k in FILL_SETTING_KEYWORDS) for prop in child_values)
+            ):
+                result["nested"][child_name] = child_values
+
+    try:
+        tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+    except Exception:
+        tool = None
+    if tool is not None:
+        for op_id in FILL_OPERATOR_IDS:
+            try:
+                props = tool.operator_properties(op_id)
+            except Exception:
+                continue
+            values = collect_props(props, include_all=True, limit=400)
+            if values:
+                result["operator_properties"][op_id] = values
+
+    if not any(result.values()):
+        return {}
+    return result
+
+
+def apply_fill_settings(context, data):
+    applied, skipped = 0, []
+    if not isinstance(data, dict):
+        return {"applied": 0, "skipped": []}
+
+    ts = safe_get(context, "tool_settings")
+    a, s = apply_props(ts, data.get("tool_settings", {}))
+    applied += a
+    skipped += [f"tool_settings.{x}" for x in s]
+
+    for child_name, values in data.get("nested", {}).items():
+        child = safe_get(ts, child_name)
+        a, s = apply_props(child, values)
+        applied += a
+        skipped += [f"{child_name}.{x}" for x in s]
+
+    try:
+        tool = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+    except Exception:
+        tool = None
+    if tool is not None:
+        for op_id, values in data.get("operator_properties", {}).items():
+            try:
+                props = tool.operator_properties(op_id)
+            except Exception:
+                skipped.append(f"{op_id} unavailable")
+                continue
+            a, s = apply_props(props, values)
+            applied += a
+            skipped += [f"{op_id}.{x}" for x in s]
+
+    return {"applied": applied, "skipped": skipped}
+
+
+def fill_settings_summary(data):
+    fill = data.get("fill_settings", {}) if isinstance(data, dict) else {}
+    flat = {}
+    for section in ("tool_settings",):
+        flat.update(fill.get(section, {}))
+    for child, values in fill.get("nested", {}).items():
+        for key, value in values.items():
+            flat[f"{child}.{key}"] = value
+    for op_id, values in fill.get("operator_properties", {}).items():
+        for key, value in values.items():
+            flat[f"{op_id}.{key}"] = value
+
+    preferred = {}
+    for label, needles in (
+        ("Solver", ("solver", "algorithm", "delaunay")),
+        ("Gap Closure", ("gap", "closure")),
+        ("Precision", ("precision",)),
+        ("Invert", ("invert",)),
+        ("Extension", ("extend", "extension")),
+    ):
+        for key, value in flat.items():
+            if any(n in key.lower() for n in needles):
+                preferred[label] = value
+                break
+    return {"count": len(flat), "preferred": preferred}
+
+
 def capture_current_preset(context, name):
     brush = active_brush(context)
     mat = safe_get(getattr(context, "object", None), "active_material")
-    material_info = capture_material_info(mat)
+    material_info = capture_color_info(context, mat, brush)
     return {
         "schema_version": SCHEMA_VERSION,
         "name": name,
@@ -404,6 +653,7 @@ def capture_current_preset(context, name):
         "material_info": material_info,
         "brush": capture_brush(brush),
         "tool_settings": capture_tool_settings(context),
+        "fill_settings": capture_fill_settings(context),
     }
 
 
@@ -417,9 +667,17 @@ def apply_preset_data(context, data, prefs=None):
         skipped.append("material missing")
     brush_result = restore_brush_to_runtime(context, data.get("brush", {}))
     skipped += brush_result.get("skipped", [])
+
+    runtime = bpy.data.brushes.get(RUNTIME_BRUSH_NAME)
+    color_result = apply_saved_color_mode(
+        context, data.get("material_info", {}), runtime
+    )
+    skipped += color_result.get("skipped", [])
+
     ts_result = restore_tool_settings(context, data.get("tool_settings", {}))
     skipped += ts_result.get("skipped", [])
-    runtime = bpy.data.brushes.get(RUNTIME_BRUSH_NAME)
+    fill_result = apply_fill_settings(context, data.get("fill_settings", {}))
+    skipped += fill_result.get("skipped", [])
     if runtime:
         set_active_brush(context, runtime)
     if prefs is not None:
@@ -429,7 +687,8 @@ def apply_preset_data(context, data, prefs=None):
             pass
     return {
         "brush_name": brush_result.get("brush_name", ""),
-        "applied": brush_result.get("applied", 0) + ts_result.get("applied", 0),
+        "applied": (brush_result.get("applied", 0) + ts_result.get("applied", 0)
+                    + fill_result.get("applied", 0) + color_result.get("applied", 0)),
         "skipped": skipped,
     }
 
@@ -443,6 +702,10 @@ def preset_summary(data):
         "source_brush": brush.get("source_brush_name", ""),
         "runtime_brush": RUNTIME_BRUSH_NAME,
         "material": material.get("name", ""),
+        "color_source": material.get("color_source", "MATERIAL"),
+        "color_mode_raw": material.get("color_mode_raw", ""),
+        "stroke_source_path": material.get("stroke_source_path", ""),
+        "fill_source_path": material.get("fill_source_path", ""),
         "stroke_color": rgba_or_default(material.get("stroke_color")),
         "fill_color": rgba_or_default(material.get("fill_color")),
         "stroke_hex": material.get("stroke_hex", ""),

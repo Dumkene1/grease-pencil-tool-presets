@@ -67,6 +67,8 @@ class GPTOOLPRESETS_PT_panel(bpy.types.Panel):
             box.label(text=f"Source Brush: {s.get('source_brush') or '-'}")
             box.label(text=f"Runtime Brush: {s.get('runtime_brush') or '-'}")
             box.label(text=f"Material: {s.get('material') or '-'}")
+            source_label = str(s.get("color_source", "MATERIAL")).replace("_", " ").title()
+            box.label(text=f"Color Source: {source_label}")
 
             try:
                 prefs.stroke_preview = s.get("stroke_color", (0.0, 0.0, 0.0, 1.0))
@@ -75,7 +77,7 @@ class GPTOOLPRESETS_PT_panel(bpy.types.Panel):
                 pass
 
             color_box = layout.box()
-            color_box.label(text="Saved Material Reference", icon="MATERIAL")
+            color_box.label(text="Saved Color Reference", icon="COLOR")
 
             row = color_box.row(align=True)
             row.prop(prefs, "stroke_preview", text="Stroke")
@@ -94,6 +96,21 @@ class GPTOOLPRESETS_PT_panel(bpy.types.Panel):
                 op.value = value
 
             color_box.label(text="Use Copy for exact color. Swatches are visual previews.", icon="INFO")
+            if s.get("color_source") == "COLOR_ATTRIBUTE":
+                color_box.label(text="Saved from Color Attribute mode.", icon="INFO")
+            else:
+                color_box.label(text="Saved from Material mode.", icon="INFO")
+
+            fill_info = s.get("fill_summary", {})
+            if fill_info.get("count", 0):
+                fill_box = layout.box()
+                fill_box.label(text="Saved Fill Values", icon="OUTLINER_DATA_GREASEPENCIL")
+                fill_box.label(text=f"Captured Settings: {fill_info.get('count', 0)}")
+                for label, value in fill_info.get("preferred", {}).items():
+                    fill_box.label(text=f"{label}: {value}")
+                saved_in = str(s.get("saved_in", ""))
+                if saved_in.startswith("5.2") and bpy.app.version < (5, 2, 0):
+                    fill_box.label(text="Some Blender 5.2 Fill values may be unavailable.", icon="ERROR")
 
             brush_box = layout.box()
             brush_box.label(text="Saved Brush Values", icon="BRUSH_DATA")
